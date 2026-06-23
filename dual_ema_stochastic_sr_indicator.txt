@@ -1,0 +1,229 @@
+//@version=5
+indicator("Dual EMA Stochastic Mean-Reversion + S/R (EOD)", shorttitle="EMA+Stoch+SR EOD", overlay=true, max_labels_count=500)
+
+// -------------------------
+// Inputs
+// -------------------------
+emaFastLen = input.int(5, "EMA Fast Length", minval=1)
+emaSlowLen = input.int(10, "EMA Slow Length", minval=1)
+
+stochLen = input.int(14, "Stochastic Length", minval=1)
+stochSmoothK = input.int(3, "Stochastic K Smoothing", minval=1)
+stochSmoothD = input.int(3, "Stochastic D Smoothing", minval=1)
+
+adxLen = input.int(14, "ADX Length", minval=1)
+atrLen = input.int(14, "ATR Length", minval=1)
+atrBaseLen = input.int(20, "ATR Baseline MA Length", minval=1)
+rejectHighVol = input.bool(false, "Reject High Volatility (>120% ATR/MA)")
+
+srLookback = input.int(60, "S/R Lookback Bars", minval=20)
+srPivotLen = input.int(2, "S/R Pivot Strength", minval=1)
+
+pipSize = input.float(0.0001, "Pip Size", minval=0.00001, step=0.00001)
+entryOffsetPips = input.float(5.0, "Entry Offset (Pips)", minval=0.0, step=0.1)
+srProximityPips = input.float(25.0, "S/R Proximity (Pips)", minval=1.0, step=0.5)
+
+useTimeWindow = input.bool(true, "Use 22:00-00:00 UTC Entry Window (Intraday only)")
+
+// -------------------------
+// Core indicators
+// -------------------------
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+
+kRaw = ta.stoch(high, low, close, stochLen)
+k = ta.sma(kRaw, stochSmoothK)
+d = ta.sma(k, stochSmoothD)
+
+adx = ta.adx(adxLen)
+atr = ta.atr(atrLen)
+atrBase = ta.sma(atr, atrBaseLen)
+atrRatio = atrBase > 0 ? atr / atrBase : na
+
+// -------------------------
+// Step 1: EMA crossover validity (24h)
+// -------------------------
+bullCross = ta.crossover(emaFast, emaSlow)
+bearCross = ta.crossunder(emaFast, emaSlow)
+
+var int lastBullCrossTs = na
+var int lastBearCrossTs = na
+
+if bullCross
+    lastBullCrossTs := time
+if bearCross
+    lastBearCrossTs := time
+
+dayMs = 24 * 60 * 60 * 1000
+bullCrossValid = not na(lastBullCrossTs) and time > lastBullCrossTs and (time - lastBullCrossTs) <= dayMs and (na(lastBearCrossTs) or lastBullCrossTs > lastBearCrossTs)
+bearCrossValid = not na(lastBearCrossTs) and time > lastBearCrossTs and (time - lastBearCrossTs) <= dayMs and (na(lastBullCrossTs) or lastBearCrossTs > lastBullCrossTs)
+
+// -------------------------
+// Step 2: Stochastic optimized filters
+// -------------------------
+extremeStoch = (k > 90) or (k < 10)
+stochBuyOk = (k >= 25 and k <= 45) and (k > d) and not extremeStoch
+stochSellOk = (k >= 65 and k <= 90) and (k < d) and not extremeStoch
+
+// -------------------------
+// Step 3: ADX filter
+// -------------------------
+adxOk = adx >= 20
+
+// -------------------------
+// Step 4: ATR volatility filter
+// -------------------------
+volLow = atrRatio < 0.8
+volNormal = atrRatio >= 0.8 and atrRatio <= 1.2
+volHigh = atrRatio > 1.2 and atrRatio <= 1.5
+volExtreme = atrRatio > 1.5
+
+atrOk = rejectHighVol ? (volLow or volNormal) : (volLow or volNormal or volHigh)
+
+stopPips = volLow ? 75.0 : volHigh ? 150.0 : 100.0
+
+// -------------------------
+// Step 5: Candlestick patterns
+// -------------------------
+range = high - low
+body = math.abs(close - open)
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+
+bodyPct = range > 0 ? body / range : 0.0
+upperPct = range > 0 ? upperWick / range : 0.0
+lowerPct = range > 0 ? lowerWick / range : 0.0
+
+// Hammer (buy only)
+hammerBull = range > 0 and bodyPct >= 0.20 and bodyPct <= 0.30 and upperPct < 0.20 and lowerPct >= 0.50 and lowerPct <= 0.70 and close > open
+
+// Inside bar breakout (uses prior bar as inside bar, current bar as breakout)
+insidePrev = high[1] < high[2] and low[1] > low[2]
+bullInsideBreak = insidePrev and close > high[1]
+bearInsideBreak = insidePrev and close < low[1]
+
+// Engulfing
+bullEngulf = close[1] < open[1] and close > open and open <= close[1] and close >= open[1]
+bearEngulf = close[1] > open[1] and close < open and open >= close[1] and close <= open[1]
+
+// Doji + confirmation (doji on previous candle)
+prevRange = high[1] - low[1]
+prevBody = math.abs(close[1] - open[1])
+prevUpper = high[1] - math.max(open[1], close[1])
+prevLower = math.min(open[1], close[1]) - low[1]
+
+prevBodyPct = prevRange > 0 ? prevBody / prevRange : 1.0
+prevUpperPct = prevRange > 0 ? prevUpper / prevRange : 0.0
+prevLowerPct = prevRange > 0 ? prevLower / prevRange : 0.0
+
+prevIsDoji = prevRange > 0 and prevBodyPct < 0.10 and prevUpperPct >= 0.40 and prevUpperPct <= 0.60 and prevLowerPct >= 0.40 and prevLowerPct <= 0.60
+bullDojiConfirm = prevIsDoji and close > high[1] and close > open
+bearDojiConfirm = prevIsDoji and close < low[1] and close < open
+
+bullPatternCount = (hammerBull ? 1 : 0) + (bullInsideBreak ? 1 : 0) + (bullEngulf ? 1 : 0) + (bullDojiConfirm ? 1 : 0)
+bearPatternCount = (bearInsideBreak ? 1 : 0) + (bearEngulf ? 1 : 0) + (bearDojiConfirm ? 1 : 0)
+
+bullPatternOk = bullPatternCount == 1
+bearPatternOk = bearPatternCount == 1
+
+bullPatternHigh = hammerBull ? high : bullInsideBreak ? high[1] : bullEngulf ? high : bullDojiConfirm ? high[1] : na
+bearPatternLow = bearInsideBreak ? low[1] : bearEngulf ? low : bearDojiConfirm ? low[1] : na
+
+// -------------------------
+// Step 6: Support/Resistance validation
+// -------------------------
+pL = ta.pivotlow(low, srPivotLen, srPivotLen)
+pH = ta.pivothigh(high, srPivotLen, srPivotLen)
+
+supportLevel = nz(ta.valuewhen(not na(pL), pL, 0), ta.lowest(low, srLookback))
+resistanceLevel = nz(ta.valuewhen(not na(pH), pH, 0), ta.highest(high, srLookback))
+
+srTol = srProximityPips * pipSize
+
+supportTouches = ta.sum(math.abs(low - supportLevel) <= srTol ? 1 : 0, srLookback)
+resistanceTouches = ta.sum(math.abs(high - resistanceLevel) <= srTol ? 1 : 0, srLookback)
+
+strongSupport = supportTouches >= 3
+strongResistance = resistanceTouches >= 3
+
+nearSupport = math.abs(close - supportLevel) <= srTol
+nearResistance = math.abs(close - resistanceLevel) <= srTol
+
+buyConfidenceAdj = nearSupport and strongSupport ? 25 : nearResistance and strongResistance ? -50 : 0
+sellConfidenceAdj = nearResistance and strongResistance ? 25 : nearSupport and strongSupport ? -50 : 0
+
+buyConfidence = 100 + buyConfidenceAdj
+sellConfidence = 100 + sellConfidenceAdj
+
+buySROk = not (nearResistance and strongResistance) and buyConfidence >= 75
+sellSROk = not (nearSupport and strongSupport) and sellConfidence >= 75
+
+// -------------------------
+// Step 7: Time window validation (UTC, intraday only)
+// -------------------------
+minuteOfDayUtc = hour(time, "UTC") * 60 + minute(time, "UTC")
+inEntryWindow = minuteOfDayUtc >= 22 * 60 and minuteOfDayUtc < 24 * 60
+inBlockedWindow = minuteOfDayUtc >= 22 * 60 and minuteOfDayUtc < (22 * 60 + 15)
+timeOk = useTimeWindow ? (timeframe.isintraday ? (inEntryWindow and not inBlockedWindow) : true) : true
+
+// -------------------------
+// Final setup and signals
+// -------------------------
+buySetup = bullCrossValid and stochBuyOk and adxOk and atrOk and not volExtreme and bullPatternOk and buySROk
+sellSetup = bearCrossValid and stochSellOk and adxOk and atrOk and not volExtreme and bearPatternOk and sellSROk
+
+buySignal = buySetup and timeOk
+sellSignal = sellSetup and timeOk
+
+queuedBuy = buySetup and useTimeWindow and timeframe.isintraday and not timeOk
+queuedSell = sellSetup and useTimeWindow and timeframe.isintraday and not timeOk
+
+entryOffset = entryOffsetPips * pipSize
+buyEntry = buySignal and not na(bullPatternHigh) ? bullPatternHigh + entryOffset : na
+sellEntry = sellSignal and not na(bearPatternLow) ? bearPatternLow - entryOffset : na
+
+buySL = buySignal and not na(buyEntry) ? buyEntry - stopPips * pipSize : na
+sellSL = sellSignal and not na(sellEntry) ? sellEntry + stopPips * pipSize : na
+
+buyTP1 = buySignal and not na(buyEntry) ? buyEntry + stopPips * pipSize : na
+sellTP1 = sellSignal and not na(sellEntry) ? sellEntry - stopPips * pipSize : na
+
+// -------------------------
+// Plots
+// -------------------------
+plot(emaFast, "EMA 5", color=color.new(color.teal, 0), linewidth=2)
+plot(emaSlow, "EMA 10", color=color.new(color.orange, 0), linewidth=2)
+
+plot(supportLevel, "Support (Pivot)", color=color.new(color.green, 55), style=plot.style_linebr)
+plot(resistanceLevel, "Resistance (Pivot)", color=color.new(color.red, 55), style=plot.style_linebr)
+
+plotshape(buySignal, title="BUY Signal", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 0), text="BUY", textcolor=color.white, size=size.tiny)
+plotshape(sellSignal, title="SELL Signal", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), text="SELL", textcolor=color.white, size=size.tiny)
+
+plotshape(queuedBuy, title="Queued BUY", style=shape.triangleup, location=location.belowbar, color=color.new(color.yellow, 0), text="Q BUY", textcolor=color.black, size=size.tiny)
+plotshape(queuedSell, title="Queued SELL", style=shape.triangledown, location=location.abovebar, color=color.new(color.yellow, 0), text="Q SELL", textcolor=color.black, size=size.tiny)
+
+plot(buyEntry, "Buy Entry (Limit)", color=color.new(color.green, 0), style=plot.style_circles, linewidth=2)
+plot(buySL, "Buy SL", color=color.new(color.red, 0), style=plot.style_circles)
+plot(buyTP1, "Buy TP1", color=color.new(color.blue, 0), style=plot.style_circles)
+
+plot(sellEntry, "Sell Entry (Limit)", color=color.new(color.red, 0), style=plot.style_circles, linewidth=2)
+plot(sellSL, "Sell SL", color=color.new(color.green, 0), style=plot.style_circles)
+plot(sellTP1, "Sell TP1", color=color.new(color.blue, 0), style=plot.style_circles)
+
+// -------------------------
+// Alerts
+// -------------------------
+alertcondition(buySignal, title="BUY Setup Confirmed", message="BUY setup confirmed: EMA/Stoch/ADX/ATR/Pattern/SR all valid.")
+alertcondition(sellSignal, title="SELL Setup Confirmed", message="SELL setup confirmed: EMA/Stoch/ADX/ATR/Pattern/SR all valid.")
+alertcondition(queuedBuy or queuedSell, title="Setup Queued (Outside Time Window)", message="Valid setup exists but outside the 22:00-00:00 UTC window.")
+
+// -------------------------
+// Status line
+// -------------------------
+var label statusLbl = na
+if barstate.islast
+    label.delete(statusLbl)
+    regime = volExtreme ? "EXTREME VOL" : volHigh ? "HIGH VOL" : volLow ? "LOW VOL" : "NORMAL VOL"
+    txt = "ADX: " + str.tostring(adx, "#.##") + " | Stoch K/D: " + str.tostring(k, "#.##") + "/" + str.tostring(d, "#.##") + " | " + regime
+    statusLbl := label.new(bar_index, high, txt, style=label.style_label_down, color=color.new(color.black, 70), textcolor=color.white)
